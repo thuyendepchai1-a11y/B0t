@@ -1028,9 +1028,10 @@ async function convertPdfToQuizImages(pdfBuffer, answersArray, subject, numQuest
     throw new Error(`Không tìm thấy kênh dump (ID: ${dumpChannelId}).\nHãy set biến môi trường \`PDF_DUMP_CHANNEL_ID\`.`);
   }
 
-  const RENDER_SCALE = 2.5;   // Giữ nguyên ~210 DPI
-  const PAD_TOP      = 6;     // Giảm padding để không cắt mất đầu câu
-  const PAD_BOT      = 8;     // Tăng padding dưới để giữ hình ảnh/công thức
+  const RENDER_SCALE = 2.5;
+  const PAD_TOP      = 35;   // ⬆️ Tăng: lùi lên trên để lấy đủ phần đầu số câu
+  const PAD_BOT      = 30;   // ⬆️ Tăng: cắt cao hơn để tránh lấn câu tiếp theo
+  const MIN_HEIGHT   = 100;  // ⬆️ Đảm bảo ảnh không quá nhỏ
 
   // ── 1. Render chỉ 2 trang đầu (tối ưu cho 12 câu đầu) ──
   await interaction.editReply({ embeds: [progressEmbed('`[1/3]` Đang render PDF → ảnh...')] });
@@ -1083,20 +1084,22 @@ async function convertPdfToQuizImages(pdfBuffer, answersArray, subject, numQuest
     const pageBuf  = pageImages[pageIdx];
     const pageMeta = await sharp(pageBuf).metadata();
 
+// Lùi top lên nhiều hơn, nhưng không vượt quá biên trang
     const topY = Math.max(0, Math.floor(startBound.yPx) - PAD_TOP);
-    let botY;
 
+    let botY;
     if (endBound && endBound.pageIdx === pageIdx) {
+  // Cắt sâu vào trước câu tiếp (lùi nhiều hơn)
       botY = Math.floor(endBound.yPx) - PAD_BOT;
     } else if (endBound && endBound.pageIdx > pageIdx) {
-      // Câu kéo dài sang trang sau → lấy đến cuối trang hiện tại
-      botY = pageMeta.height - 30;
+      botY = pageMeta.height - 40;  // ⬆️ Để lại margin đáy nhiều hơn
     } else {
-      // Không có end bound → heuristic 30% chiều cao trang (đủ cho câu toán có hình)
-      botY = Math.min(pageMeta.height - 30, topY + Math.floor(pageMeta.height * 0.30));
+  // Fallback: ước lượng chiều cao câu toán (thường 25-35% trang)
+      botY = Math.min(pageMeta.height - 40, topY + Math.floor(pageMeta.height * 0.28));
     }
 
-    const cropH = Math.max(80, botY - topY);
+// Đảm bảo chiều cao tối thiểu
+    const cropH = Math.max(MIN_HEIGHT, botY - topY);
 
     let cropBuf;
     try {
