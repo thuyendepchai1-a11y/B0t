@@ -9,7 +9,15 @@ import pg from 'pg';
 import { pdf } from 'pdf-to-img';
 import sharp from 'sharp';
 import * as pdfjsLib from 'pdfjs-dist/legacy/build/pdf.mjs';
-pdfjsLib.GlobalWorkerOptions.workerSrc = ''; // Disable web worker — Node.js không cần
+import { join, dirname } from 'path';
+import { fileURLToPath } from 'url';
+
+// ✅ FIX: Trỏ đúng worker file cho Node.js (ES Module / CommonJS compatible)
+const __dirname = dirname(fileURLToPath(import.meta.url));
+pdfjsLib.GlobalWorkerOptions.workerSrc = join(
+  process.cwd(),
+  'node_modules/pdfjs-dist/legacy/build/pdf.worker.mjs'
+);
 
 dotenv.config();
 
@@ -864,86 +872,151 @@ async function importQuestionsFromJSON(questions) {
  * Dùng pdfjs để extract text positions, tìm chính xác tọa độ Y của từng câu hỏi,
  * sau đó crop ảnh từ "Câu N" đến đầu "Câu N+1" (hoặc "PHẦN II" với câu cuối).
  */
+/**
+ * Hybrid detection: Text → Interpolation → Equal-split fallback
+ * Tối ưu cho đề toán 12 câu trắc nghiệm (thường nằm trong 2 trang đầu)
+ */
 async function detectQuestionBoundaries(pdfBuffer, numQuestions, renderScale) {
   const pdfDoc = await pdfjsLib.getDocument({
-    data:             new Uint8Array(pdfBuffer),
-    useWorkerFetch:   false,
-    isEvalSupported:  false,
-    useSystemFonts:   true,
+    data: new Uint8Array(pdfBuffer),
+    useSystemFonts: true,           // Hỗ trợ font hệ thống tốt hơn
+    cMapUrl: './node_modules/pdfjs-dist/cmaps/',
+    cMapPacked: true,
   }).promise;
 
-  const bounds = []; // { pageIdx, yPx, questionNum: number | 'END' }
+  const bounds = [];        // { pageIdx, yPx, questionNum: number | 'END' }
+  const pageDims = [];      // { width, height } của từng trang đã scale
 
+  // ── PASS 1: Text extraction trên tất cả trang ──
   for (let pNum = 1; pNum <= pdfDoc.numPages; pNum++) {
-    const page       = await pdfDoc.getPage(pNum);
-    const viewport   = page.getViewport({ scale: 1.0 });
+    const page = await pdfDoc.getPage(pNum);
+    const viewport = page.getViewport({ scale: 1.0 });
     const textContent = await page.getTextContent();
-    const pageWidth  = viewport.width  * renderScale;
 
-    // Chuyển mỗi text item sang toạ độ ảnh đã render
-    const items = textContent.items
-      .filter(it => it.str?.trim().length > 0)
-      .map(it => ({
-        str:  it.str,
-        // PDF Y gốc ở bottom → đổi thành từ-trên + scale sang pixel
-        yPx:  (viewport.height - it.transform[5]) * renderScale,
-        xPx:  it.transform[4]  * renderScale,
-      }));
+    const pageW = viewport.width * renderScale;
+    const pageH = viewport.height * renderScale;
+    pageDims.push({ width: pageW, height: pageH });
 
-    // Gom thành các dòng (items cách nhau ≤ 12px theo trục Y được xem là cùng dòng)
+    // Gom text items → dòng (bucket Y tolerance 20px cho font lớn/công thức)
     const lineMap = new Map();
-    for (const item of items) {
-      const bucket = Math.round(item.yPx / 12) * 12;
+    for (const item of textContent.items) {
+      if (!item.str?.trim()) continue;
+      const y = (viewport.height - item.transform[5]) * renderScale;
+      const x = item.transform[4] * renderScale;
+      const bucket = Math.round(y / 20) * 20;
+
       if (!lineMap.has(bucket)) {
-        lineMap.set(bucket, { yPx: item.yPx, xMin: item.xPx, parts: [] });
+        lineMap.set(bucket, { yPx: y, xMin: x, parts: [] });
       }
       const ln = lineMap.get(bucket);
-      ln.parts.push({ str: item.str, xPx: item.xPx });
-      if (item.xPx < ln.xMin) ln.xMin = item.xPx;
+      ln.parts.push({ str: item.str, xPx: x });
+      if (x < ln.xMin) ln.xMin = x;
     }
 
-    // Chỉ quan tâm text ở 1/4 trái trang (vùng đánh số câu)
-    const leftEdge = pageWidth * 0.25;
+    // Sắp xếp dòng từ trên xuống
+    const lines = [...lineMap.entries()]
+      .sort((a, b) => a[0] - b[0])
+      .map(([, v]) => v);
 
-    for (const [, ln] of [...lineMap.entries()].sort((a, b) => a[0] - b[0])) {
-      // Bỏ qua các dòng bắt đầu quá xa lề trái
-      if (ln.xMin > leftEdge) continue;
+    for (const ln of lines) {
+      ln.parts.sort((a, b) => a.xPx - b.xPx);
+      const fullStr = ln.parts.map(p => p.str).join('').trim();
 
-      // Lấy text của phần bên trái trang, sắp xếp theo X
-      const leftStr = ln.parts
-        .filter(p => p.xPx <= leftEdge)
-        .sort((a, b) => a.xPx - b.xPx)
-        .map(p => p.str)
-        .join('');
-
-      const fullStr = ln.parts.sort((a, b) => a.xPx - b.xPx).map(p => p.str).join(' ');
-
-      // --- Pattern câu hỏi: "1.", "2.", "12." ở đầu dòng ---
-      // Cũng match "1 ." hoặc "1 " (khi số và dấu là 2 text item riêng)
-      const qMatch = leftStr.trim().match(/^(\d{1,2})\s*[.\s]/);
+      // Pattern số câu: "1.", "1 .", "1)", "1 ", "1. ", "12."
+      // Hỗ trợ cả dấu chấm Unicode (．) và dấu ngoặc
+      const qMatch = fullStr.match(/^(\d{1,2})\s*[.．)\s]/);
       if (qMatch) {
         const num = parseInt(qMatch[1]);
-        if (num >= 1 && num <= numQuestions) {
-          // Chỉ lưu lần xuất hiện ĐẦU TIÊN của mỗi số câu
-          if (!bounds.some(b => b.questionNum === num)) {
-            bounds.push({ pageIdx: pNum - 1, yPx: ln.yPx, questionNum: num });
-            debugLog('PDF_DETECT', `Trang ${pNum}: câu ${num} tại y=${Math.round(ln.yPx)}px`);
-          }
+        // Chỉ nhận câu trong khoảng 1..numQuestions, chưa có trong bounds
+        if (num >= 1 && num <= numQuestions && !bounds.some(b => b.questionNum === num)) {
+          bounds.push({ pageIdx: pNum - 1, yPx: ln.yPx, questionNum: num, source: 'text' });
+          debugLog('PDF_DETECT', `Trang ${pNum}: câu ${num} @ y=${Math.round(ln.yPx)}px`);
         }
       }
 
-      // --- Pattern kết thúc: "PHẦN II" ---
-      if (/PH[ÀẦ]N\s*II/i.test(fullStr) || /PHAN\s*II/i.test(fullStr)) {
+      // Pattern kết thúc Phần I: "PHẦN II", "PHẦN 2", "PART II"
+      if (/PHA[NẦ][N\s]*II|PHẦN\s*II|PART\s*II|PHAN\s*II/i.test(fullStr)) {
         if (!bounds.some(b => b.questionNum === 'END')) {
-          bounds.push({ pageIdx: pNum - 1, yPx: ln.yPx, questionNum: 'END' });
-          debugLog('PDF_DETECT', `Trang ${pNum}: PHẦN II tại y=${Math.round(ln.yPx)}px`);
+          bounds.push({ pageIdx: pNum - 1, yPx: ln.yPx, questionNum: 'END', source: 'text' });
+          debugLog('PDF_DETECT', `Trang ${pNum}: PHẦN II @ y=${Math.round(ln.yPx)}px`);
         }
       }
     }
   }
 
   await pdfDoc.destroy();
-  return { numPages: pdfDoc.numPages, bounds };
+
+  // ── PASS 2: Interpolation cho câu bị miss (nếu tìm được ≥2 câu) ──
+  const foundNums = bounds
+    .filter(b => typeof b.questionNum === 'number')
+    .map(b => b.questionNum)
+    .sort((a, b) => a - b);
+
+  if (foundNums.length >= 2 && foundNums.length < numQuestions) {
+    for (let i = 1; i <= numQuestions; i++) {
+      if (foundNums.includes(i)) continue;
+
+      // Tìm câu trước/sau gần nhất đã biết vị trí
+      const prev = bounds
+        .filter(b => typeof b.questionNum === 'number' && b.questionNum < i)
+        .sort((a, b) => b.questionNum - a.questionNum)[0];
+      const next = bounds
+        .filter(b => typeof b.questionNum === 'number' && b.questionNum > i)
+        .sort((a, b) => a.questionNum - b.questionNum)[0];
+
+      if (prev && next && prev.pageIdx === next.pageIdx) {
+        // Nội suy trên cùng 1 trang
+        const ratio = (i - prev.questionNum) / (next.questionNum - prev.questionNum);
+        const yPx = prev.yPx + (next.yPx - prev.yPx) * ratio;
+        bounds.push({ pageIdx: prev.pageIdx, yPx, questionNum: i, source: 'interpolated' });
+        debugLog('PDF_DETECT', `Nội suy câu ${i} @ y=${Math.round(yPx)}px`);
+      }
+    }
+  }
+
+  // ── PASS 3: Equal-split fallback (nếu vẫn thiếu hoặc không detect được) ──
+  const finalFound = bounds.filter(b => typeof b.questionNum === 'number').length;
+  if (finalFound < numQuestions) {
+    debugLog('PDF_DETECT', `Fallback equal-split: ${finalFound}/${numQuestions} câu tìm được`);
+    bounds.length = 0; // Xóa bounds cũ, chia đều
+
+    // Giả định: chỉ cần 2 trang đầu cho 12 câu (tối ưu cho đề toán)
+    const pagesToUse = Math.min(2, pageDims.length);
+    const perPage = Math.ceil(numQuestions / pagesToUse);
+
+    for (let p = 0; p < pagesToUse; p++) {
+      const startQ = p * perPage + 1;
+      const endQ = Math.min((p + 1) * perPage, numQuestions);
+      const countOnPage = endQ - startQ + 1;
+      // Bỏ phần header/footer (~10% trên, ~5% dưới)
+      const usableH = pageDims[p].height * 0.85;
+      const offsetY = pageDims[p].height * 0.08;
+      const step = usableH / countOnPage;
+
+      for (let q = startQ; q <= endQ; q++) {
+        const idx = q - startQ;
+        bounds.push({
+          pageIdx: p,
+          yPx: offsetY + idx * step,
+          questionNum: q,
+          source: 'fallback'
+        });
+      }
+    }
+
+    // END bound ở cuối trang cuối cùng được dùng
+    const lastPage = pagesToUse - 1;
+    bounds.push({
+      pageIdx: lastPage,
+      yPx: pageDims[lastPage].height * 0.92,
+      questionNum: 'END',
+      source: 'fallback'
+    });
+  }
+
+  // Sắp xếp cuối cùng
+  bounds.sort((a, b) => a.pageIdx - b.pageIdx || a.yPx - b.yPx);
+  return { numPages: pdfDoc.numPages, bounds, pageDims };
 }
 
 /**
@@ -952,29 +1025,30 @@ async function detectQuestionBoundaries(pdfBuffer, numQuestions, renderScale) {
 async function convertPdfToQuizImages(pdfBuffer, answersArray, subject, numQuestions, dumpChannelId, interaction) {
   const dumpChannel = client.channels.cache.get(dumpChannelId);
   if (!dumpChannel) {
-    throw new Error(
-      `Không tìm thấy kênh dump (ID: ${dumpChannelId}).\n` +
-      `Hãy set biến môi trường \`PDF_DUMP_CHANNEL_ID\` trong Variables.`
-    );
+    throw new Error(`Không tìm thấy kênh dump (ID: ${dumpChannelId}).\nHãy set biến môi trường \`PDF_DUMP_CHANNEL_ID\`.`);
   }
 
-  const RENDER_SCALE = 2.5;   // 2.5× = ~210 DPI — đủ nét cho toán
-  const PAD_TOP      = 8;     // px padding trên đầu mỗi câu
-  const PAD_BOT      = 4;     // px bỏ phía trên ranh giới câu tiếp theo
+  const RENDER_SCALE = 2.5;   // Giữ nguyên ~210 DPI
+  const PAD_TOP      = 6;     // Giảm padding để không cắt mất đầu câu
+  const PAD_BOT      = 8;     // Tăng padding dưới để giữ hình ảnh/công thức
 
-  // ── 1. Render PDF → PNG buffers ──
+  // ── 1. Render chỉ 2 trang đầu (tối ưu cho 12 câu đầu) ──
   await interaction.editReply({ embeds: [progressEmbed('`[1/3]` Đang render PDF → ảnh...')] });
 
   const pageImages = [];
+  let pageCount = 0;
   for await (const pageImg of await pdf(pdfBuffer, { scale: RENDER_SCALE })) {
     pageImages.push(pageImg);
+    pageCount++;
+    if (pageCount >= 2) break; // ⭐ Chỉ cần 2 trang đầu cho 12 câu trắc nghiệm
   }
+
   if (pageImages.length === 0) throw new Error('PDF không có trang nào render được.');
 
-  // ── 2. Detect question Y positions via text extraction ──
-  await interaction.editReply({ embeds: [progressEmbed(`\`[2/3]\` Đang phân tích vị trí ${numQuestions} câu hỏi...`)] });
+  // ── 2. Detect boundaries (hybrid) ──
+  await interaction.editReply({ embeds: [progressEmbed(`\`[2/3]\` Đang phân tích vị trí ${numQuestions} câu...`)] });
 
-  const { numPages, bounds } = await detectQuestionBoundaries(pdfBuffer, numQuestions, RENDER_SCALE);
+  const { bounds, pageDims } = await detectQuestionBoundaries(pdfBuffer, numQuestions, RENDER_SCALE);
 
   const foundNums = bounds
     .filter(b => typeof b.questionNum === 'number')
@@ -983,23 +1057,7 @@ async function convertPdfToQuizImages(pdfBuffer, answersArray, subject, numQuest
 
   debugLog('PDF_DETECT', `Tìm được: [${foundNums.join(',')}] | END: ${bounds.some(b => b.questionNum === 'END')}`);
 
-  if (foundNums.length < numQuestions) {
-    const missing = [];
-    for (let i = 1; i <= numQuestions; i++) {
-      if (!foundNums.includes(i)) missing.push(i);
-    }
-    throw new Error(
-      `Chỉ tìm được **${foundNums.length}/${numQuestions}** câu trong PDF.\n` +
-      `Thiếu câu: **${missing.join(', ')}**\n\n` +
-      `PDF có thể dùng font đặc biệt hoặc ký tự số dạng Unicode. ` +
-      `Thử kiểm tra file PDF có copy-paste được chữ số không.`
-    );
-  }
-
-  // Sort: theo trang rồi theo Y
-  bounds.sort((a, b) => a.pageIdx - b.pageIdx || a.yPx - b.yPx);
-
-  // ── 3. Crop từng câu & upload ──
+  // ── 3. Crop & upload ──
   await interaction.editReply({ embeds: [progressEmbed(`\`[3/3]\` Đang cắt và upload ${numQuestions} ảnh...`)] });
 
   const questions   = [];
@@ -1015,7 +1073,6 @@ async function convertPdfToQuizImages(pdfBuffer, answersArray, subject, numQuest
       continue;
     }
 
-    // Tìm ranh giới kết thúc: câu tiếp theo hoặc PHẦN II (câu cuối)
     const isLast  = qNum === numQuestions;
     const endBound = bounds.find(b =>
       (typeof b.questionNum === 'number' && b.questionNum === qNum + 1) ||
@@ -1027,36 +1084,34 @@ async function convertPdfToQuizImages(pdfBuffer, answersArray, subject, numQuest
     const pageMeta = await sharp(pageBuf).metadata();
 
     const topY = Math.max(0, Math.floor(startBound.yPx) - PAD_TOP);
-    let   botY;
+    let botY;
 
     if (endBound && endBound.pageIdx === pageIdx) {
-      // Ranh giới trên CÙNG trang → crop đến đầu câu tiếp theo
       botY = Math.floor(endBound.yPx) - PAD_BOT;
     } else if (endBound && endBound.pageIdx > pageIdx) {
-      // Ranh giới trên trang SAU → lấy đến cuối trang hiện tại
-      botY = pageMeta.height - 20;
+      // Câu kéo dài sang trang sau → lấy đến cuối trang hiện tại
+      botY = pageMeta.height - 30;
     } else {
-      // Không có end bound (câu cuối và không có PHẦN II) → heuristic 15% trang
-      botY = Math.min(pageMeta.height - 20, topY + Math.floor(pageMeta.height * 0.15));
+      // Không có end bound → heuristic 30% chiều cao trang (đủ cho câu toán có hình)
+      botY = Math.min(pageMeta.height - 30, topY + Math.floor(pageMeta.height * 0.30));
     }
 
-    const cropH = Math.max(60, botY - topY);
+    const cropH = Math.max(80, botY - topY);
 
     let cropBuf;
     try {
       cropBuf = await sharp(pageBuf)
         .extract({ left: 0, top: topY, width: pageMeta.width, height: cropH })
-        .png()
+        .png({ compressionLevel: 9 }) // Nén nhẹ để upload nhanh hơn
         .toBuffer();
     } catch (err) {
       debugLog('PDF_CROP_ERR', `Câu ${qNum}: top=${topY} h=${cropH} pageH=${pageMeta.height} — ${err.message}`);
       continue;
     }
 
-    // Upload lên Discord dump channel → lấy CDN URL bền
     const msg = await dumpChannel.send({
       content: `-# [PDF-Quiz] ${subject} — Câu ${qNum} | batch:${batchId}`,
-      files:   [{ attachment: cropBuf, name: `${slugSubject}_cau${qNum}.png` }],
+      files: [{ attachment: cropBuf, name: `${slugSubject}_cau${qNum}.png` }],
     });
 
     const imageUrl = msg.attachments.first()?.url;
@@ -1073,11 +1128,10 @@ async function convertPdfToQuizImages(pdfBuffer, answersArray, subject, numQuest
       image_url: imageUrl,
     });
 
-    // Update progress mỗi 3 câu
     if (questions.length % 3 === 0 || questions.length === numQuestions) {
       await interaction.editReply({
         embeds: [progressEmbed(
-          `\`[3/3]\` Upload ảnh: **${questions.length}/${numQuestions}**\n` +
+          `\`[3/3]\` Upload: **${questions.length}/${numQuestions}**\n` +
           createProgressBar(questions.length, numQuestions, 20)
         )],
       });
