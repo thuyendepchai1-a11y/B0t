@@ -1035,6 +1035,8 @@ async function convertPdfToQuizImages(pdfBuffer, answersArray, subject, numQuest
   const questions = [];
   const slugSubject = subject.toLowerCase().replace(/[^a-z0-9]/g, '_');
   const batchId = Date.now();
+  const TOP_OFFSET = 10;   // dịch lên trên 10px (bao gồm cả 5px bạn muốn thêm)
+  const BOT_OFFSET = 5;    // giữ nguyên
 
   for (let qi = 0; qi < numQuestions; qi++) {
     const qNum = qi + 1;
@@ -1044,37 +1046,31 @@ async function convertPdfToQuizImages(pdfBuffer, answersArray, subject, numQuest
       continue;
     }
 
-    // Xác định giới hạn dưới (y_end)
+  // Xác định giới hạn dưới (y_end)
     let endY = null;
     if (qNum < numQuestions) {
       const nextBound = numBounds.find(b => b.questionNum === qNum + 1);
       if (nextBound && nextBound.pageIdx === startBound.pageIdx) {
-        // Cùng trang: cắt đến trước số câu tiếp theo (trừ đi CROP_PAD)
-        endY = Math.max(startBound.yPx + 10, nextBound.yPx - CROP_PAD);
+        endY = nextBound.yPx - BOT_OFFSET;
       } else {
-        // Câu cuối trang hoặc khác trang: cắt đến cuối trang trừ 50px
-        const pageIdx = startBound.pageIdx;
-        endY = pageDims[pageIdx].height - 50;
+        endY = pageDims[startBound.pageIdx].height - 50;
       }
     } else {
-      // Câu cuối cùng (12): dùng mốc END nếu có
+    // Câu cuối cùng (12)
       if (endBound && endBound.pageIdx === startBound.pageIdx) {
-        endY = endBound.yPx - CROP_PAD;
-      } else if (endBound && endBound.pageIdx > startBound.pageIdx) {
-        // END ở trang sau: cắt đến cuối trang hiện tại
-        endY = pageDims[startBound.pageIdx].height - 50;
+        endY = endBound.yPx - BOT_OFFSET;
       } else {
         endY = pageDims[startBound.pageIdx].height - 50;
       }
     }
 
-    // Đảm bảo endY > startBound.yPx + 50 (ít nhất 50px chiều cao)
+  // Đảm bảo chiều cao tối thiểu
     const minHeight = 80;
     if (endY <= startBound.yPx + minHeight) {
       endY = startBound.yPx + minHeight;
     }
 
-    const topY = Math.max(0, Math.floor(startBound.yPx) - 2); // Giữ lại khoảng 2px phía trên số câu
+    const topY = Math.max(0, Math.floor(startBound.yPx) - TOP_OFFSET);
     const bottomY = Math.min(pageDims[startBound.pageIdx].height, Math.floor(endY));
     const cropHeight = bottomY - topY;
     if (cropHeight <= 0) {
