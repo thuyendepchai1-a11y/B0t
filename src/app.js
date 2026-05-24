@@ -8,6 +8,8 @@ import cron from 'node-cron';
 import pg from 'pg';
 import { pdf } from 'pdf-to-img';
 import sharp from 'sharp';
+import * as pdfjsLib from 'pdfjs-dist/legacy/build/pdf.mjs';
+pdfjsLib.GlobalWorkerOptions.workerSrc = ''; // Disable web worker — Node.js không cần
 
 dotenv.config();
 
@@ -856,148 +858,241 @@ async function importQuestionsFromJSON(questions) {
   return { inserted, skipped };
 }
 
-// ====================== PDF → QUIZ IMAGES ======================
+// ====================== PDF → QUIZ IMAGES (TEXT-AWARE CROPPING) ======================
+
 /**
- * Chuyển đổi PDF đề thi thành ảnh từng câu hỏi, upload lên Discord CDN,
- * trả về mảng quiz_question objects sẵn sàng để insert vào DB.
- *
- * @param {Buffer}   pdfBuffer       - Buffer nội dung file PDF
- * @param {string[]} answersArray    - Mảng đáp án, e.g. ['B','D','A','C',...]
- * @param {string}   subject         - Tên môn học, e.g. 'Toán'
- * @param {number[]} questionsPerPage - Số câu mỗi trang, e.g. [8, 4]
- * @param {string}   dumpChannelId   - ID kênh Discord để upload ảnh
- * @param {Object}   interaction     - Discord interaction để update tiến trình
+ * Dùng pdfjs để extract text positions, tìm chính xác tọa độ Y của từng câu hỏi,
+ * sau đó crop ảnh từ "Câu N" đến đầu "Câu N+1" (hoặc "PHẦN II" với câu cuối).
  */
-async function convertPdfToQuizImages(pdfBuffer, answersArray, subject, questionsPerPage, dumpChannelId, interaction) {
-  const dumpChannel = client.channels.cache.get(dumpChannelId);
-  if (!dumpChannel) throw new Error(`Không tìm thấy kênh dump (ID: ${dumpChannelId}). Set biến PDF_DUMP_CHANNEL_ID trong Variables.`);
+async function detectQuestionBoundaries(pdfBuffer, numQuestions, renderScale) {
+  const pdfDoc = await pdfjsLib.getDocument({
+    data:             new Uint8Array(pdfBuffer),
+    useWorkerFetch:   false,
+    isEvalSupported:  false,
+    useSystemFonts:   true,
+  }).promise;
 
-  // ── Bước 1: Render các trang PDF thành PNG buffer ──
-  await interaction.editReply({
-    embeds: [new EmbedBuilder()
-      .setColor(COLORS.INFO)
-      .setTitle('⏳ Đang xử lý PDF...')
-      .setDescription('`[1/3]` Đang render trang PDF → ảnh...')
-    ]
-  });
+  const bounds = []; // { pageIdx, yPx, questionNum: number | 'END' }
 
-  const pageBuffers = [];
-  try {
-    const pdfDoc = await pdf(pdfBuffer, { scale: 2.5 }); // scale 2.5x → ~210dpi, đủ nét
-    for await (const pageImage of pdfDoc) {
-      pageBuffers.push(pageImage);
+  for (let pNum = 1; pNum <= pdfDoc.numPages; pNum++) {
+    const page       = await pdfDoc.getPage(pNum);
+    const viewport   = page.getViewport({ scale: 1.0 });
+    const textContent = await page.getTextContent();
+    const pageWidth  = viewport.width  * renderScale;
+
+    // Chuyển mỗi text item sang toạ độ ảnh đã render
+    const items = textContent.items
+      .filter(it => it.str?.trim().length > 0)
+      .map(it => ({
+        str:  it.str,
+        // PDF Y gốc ở bottom → đổi thành từ-trên + scale sang pixel
+        yPx:  (viewport.height - it.transform[5]) * renderScale,
+        xPx:  it.transform[4]  * renderScale,
+      }));
+
+    // Gom thành các dòng (items cách nhau ≤ 12px theo trục Y được xem là cùng dòng)
+    const lineMap = new Map();
+    for (const item of items) {
+      const bucket = Math.round(item.yPx / 12) * 12;
+      if (!lineMap.has(bucket)) {
+        lineMap.set(bucket, { yPx: item.yPx, xMin: item.xPx, parts: [] });
+      }
+      const ln = lineMap.get(bucket);
+      ln.parts.push({ str: item.str, xPx: item.xPx });
+      if (item.xPx < ln.xMin) ln.xMin = item.xPx;
     }
-  } catch (err) {
-    throw new Error(`Lỗi đọc PDF: ${err.message}. Đảm bảo file PDF hợp lệ và không bị mã hoá.`);
+
+    // Chỉ quan tâm text ở 1/4 trái trang (vùng đánh số câu)
+    const leftEdge = pageWidth * 0.25;
+
+    for (const [, ln] of [...lineMap.entries()].sort((a, b) => a[0] - b[0])) {
+      // Bỏ qua các dòng bắt đầu quá xa lề trái
+      if (ln.xMin > leftEdge) continue;
+
+      // Lấy text của phần bên trái trang, sắp xếp theo X
+      const leftStr = ln.parts
+        .filter(p => p.xPx <= leftEdge)
+        .sort((a, b) => a.xPx - b.xPx)
+        .map(p => p.str)
+        .join('');
+
+      const fullStr = ln.parts.sort((a, b) => a.xPx - b.xPx).map(p => p.str).join(' ');
+
+      // --- Pattern câu hỏi: "1.", "2.", "12." ở đầu dòng ---
+      // Cũng match "1 ." hoặc "1 " (khi số và dấu là 2 text item riêng)
+      const qMatch = leftStr.trim().match(/^(\d{1,2})\s*[.\s]/);
+      if (qMatch) {
+        const num = parseInt(qMatch[1]);
+        if (num >= 1 && num <= numQuestions) {
+          // Chỉ lưu lần xuất hiện ĐẦU TIÊN của mỗi số câu
+          if (!bounds.some(b => b.questionNum === num)) {
+            bounds.push({ pageIdx: pNum - 1, yPx: ln.yPx, questionNum: num });
+            debugLog('PDF_DETECT', `Trang ${pNum}: câu ${num} tại y=${Math.round(ln.yPx)}px`);
+          }
+        }
+      }
+
+      // --- Pattern kết thúc: "PHẦN II" ---
+      if (/PH[ÀẦ]N\s*II/i.test(fullStr) || /PHAN\s*II/i.test(fullStr)) {
+        if (!bounds.some(b => b.questionNum === 'END')) {
+          bounds.push({ pageIdx: pNum - 1, yPx: ln.yPx, questionNum: 'END' });
+          debugLog('PDF_DETECT', `Trang ${pNum}: PHẦN II tại y=${Math.round(ln.yPx)}px`);
+        }
+      }
+    }
   }
 
-  if (pageBuffers.length === 0) throw new Error('PDF không có trang nào có thể đọc được.');
+  await pdfDoc.destroy();
+  return { numPages: pdfDoc.numPages, bounds };
+}
 
-  // Kiểm tra tổng số câu hỏi vs số trang
-  const totalQInLayout = questionsPerPage.reduce((a, b) => a + b, 0);
-  if (totalQInLayout !== answersArray.length) {
+/**
+ * Pipeline chính: PDF → detect boundaries → crop → upload Discord → trả về question objects.
+ */
+async function convertPdfToQuizImages(pdfBuffer, answersArray, subject, numQuestions, dumpChannelId, interaction) {
+  const dumpChannel = client.channels.cache.get(dumpChannelId);
+  if (!dumpChannel) {
     throw new Error(
-      `Số câu trong layout (${totalQInLayout}) không khớp với số đáp án (${answersArray.length}).\n` +
-      `Ví dụ: layout "8,4" cần đúng 12 đáp án.`
+      `Không tìm thấy kênh dump (ID: ${dumpChannelId}).\n` +
+      `Hãy set biến môi trường \`PDF_DUMP_CHANNEL_ID\` trong Variables.`
     );
   }
 
-  // ── Bước 2: Crop từng câu hỏi từ mỗi trang ──
-  await interaction.editReply({
-    embeds: [new EmbedBuilder()
-      .setColor(COLORS.INFO)
-      .setTitle('⏳ Đang xử lý PDF...')
-      .setDescription(`\`[2/3]\` Đang crop **${answersArray.length}** câu từ **${pageBuffers.length}** trang...`)
-    ]
-  });
+  const RENDER_SCALE = 2.5;   // 2.5× = ~210 DPI — đủ nét cho toán
+  const PAD_TOP      = 8;     // px padding trên đầu mỗi câu
+  const PAD_BOT      = 4;     // px bỏ phía trên ranh giới câu tiếp theo
 
-  const cropBuffers = []; // { buffer, questionNumber }
-  let qIdx = 0;
+  // ── 1. Render PDF → PNG buffers ──
+  await interaction.editReply({ embeds: [progressEmbed('`[1/3]` Đang render PDF → ảnh...')] });
 
-  for (let pageIdx = 0; pageIdx < questionsPerPage.length; pageIdx++) {
-    const qCount = questionsPerPage[pageIdx];
-    const pageBuffer = pageBuffers[pageIdx];
+  const pageImages = [];
+  for await (const pageImg of await pdf(pdfBuffer, { scale: RENDER_SCALE })) {
+    pageImages.push(pageImg);
+  }
+  if (pageImages.length === 0) throw new Error('PDF không có trang nào render được.');
 
-    if (!pageBuffer) {
-      throw new Error(`Trang ${pageIdx + 1} không tồn tại trong PDF (PDF chỉ có ${pageBuffers.length} trang).`);
+  // ── 2. Detect question Y positions via text extraction ──
+  await interaction.editReply({ embeds: [progressEmbed(`\`[2/3]\` Đang phân tích vị trí ${numQuestions} câu hỏi...`)] });
+
+  const { numPages, bounds } = await detectQuestionBoundaries(pdfBuffer, numQuestions, RENDER_SCALE);
+
+  const foundNums = bounds
+    .filter(b => typeof b.questionNum === 'number')
+    .map(b => b.questionNum)
+    .sort((a, b) => a - b);
+
+  debugLog('PDF_DETECT', `Tìm được: [${foundNums.join(',')}] | END: ${bounds.some(b => b.questionNum === 'END')}`);
+
+  if (foundNums.length < numQuestions) {
+    const missing = [];
+    for (let i = 1; i <= numQuestions; i++) {
+      if (!foundNums.includes(i)) missing.push(i);
     }
-
-    const meta = await sharp(pageBuffer).metadata();
-    const { width, height } = meta;
-
-    // Chia nội dung trang: bỏ ~7% trên (header) và ~4% dưới (footer)
-    const topMargin    = Math.floor(height * 0.07);
-    const bottomMargin = Math.floor(height * 0.04);
-    const contentH     = height - topMargin - bottomMargin;
-    const qH           = Math.floor(contentH / qCount);
-
-    for (let qi = 0; qi < qCount; qi++) {
-      const top        = topMargin + qi * qH;
-      const cropHeight = Math.min(qH, height - bottomMargin - top);
-
-      if (cropHeight <= 0) continue;
-
-      const cropBuf = await sharp(pageBuffer)
-        .extract({ left: 0, top, width, height: cropHeight })
-        .png()
-        .toBuffer();
-
-      cropBuffers.push({ buffer: cropBuf, questionNumber: qIdx + 1 });
-      qIdx++;
-    }
+    throw new Error(
+      `Chỉ tìm được **${foundNums.length}/${numQuestions}** câu trong PDF.\n` +
+      `Thiếu câu: **${missing.join(', ')}**\n\n` +
+      `PDF có thể dùng font đặc biệt hoặc ký tự số dạng Unicode. ` +
+      `Thử kiểm tra file PDF có copy-paste được chữ số không.`
+    );
   }
 
-  // ── Bước 3: Upload từng ảnh lên Discord, lấy CDN URL ──
-  await interaction.editReply({
-    embeds: [new EmbedBuilder()
-      .setColor(COLORS.INFO)
-      .setTitle('⏳ Đang xử lý PDF...')
-      .setDescription(`\`[3/3]\` Đang upload **${cropBuffers.length}** ảnh lên Discord...`)
-    ]
-  });
+  // Sort: theo trang rồi theo Y
+  bounds.sort((a, b) => a.pageIdx - b.pageIdx || a.yPx - b.yPx);
 
-  const questions = [];
+  // ── 3. Crop từng câu & upload ──
+  await interaction.editReply({ embeds: [progressEmbed(`\`[3/3]\` Đang cắt và upload ${numQuestions} ảnh...`)] });
+
+  const questions   = [];
   const slugSubject = subject.toLowerCase().replace(/[^a-z0-9]/g, '_');
   const batchId     = Date.now();
 
-  for (let i = 0; i < cropBuffers.length; i++) {
-    const { buffer, questionNumber } = cropBuffers[i];
-    const answer = answersArray[i].trim().toUpperCase();
+  for (let qi = 0; qi < numQuestions; qi++) {
+    const qNum       = qi + 1;
+    const startBound = bounds.find(b => b.questionNum === qNum);
 
-    // Upload ảnh lên dump channel → lấy attachment URL (Discord CDN)
+    if (!startBound) {
+      debugLog('PDF_CROP', `⚠️ Bỏ qua câu ${qNum} — không tìm thấy boundary`);
+      continue;
+    }
+
+    // Tìm ranh giới kết thúc: câu tiếp theo hoặc PHẦN II (câu cuối)
+    const isLast  = qNum === numQuestions;
+    const endBound = bounds.find(b =>
+      (typeof b.questionNum === 'number' && b.questionNum === qNum + 1) ||
+      (isLast && b.questionNum === 'END')
+    );
+
+    const pageIdx  = startBound.pageIdx;
+    const pageBuf  = pageImages[pageIdx];
+    const pageMeta = await sharp(pageBuf).metadata();
+
+    const topY = Math.max(0, Math.floor(startBound.yPx) - PAD_TOP);
+    let   botY;
+
+    if (endBound && endBound.pageIdx === pageIdx) {
+      // Ranh giới trên CÙNG trang → crop đến đầu câu tiếp theo
+      botY = Math.floor(endBound.yPx) - PAD_BOT;
+    } else if (endBound && endBound.pageIdx > pageIdx) {
+      // Ranh giới trên trang SAU → lấy đến cuối trang hiện tại
+      botY = pageMeta.height - 20;
+    } else {
+      // Không có end bound (câu cuối và không có PHẦN II) → heuristic 15% trang
+      botY = Math.min(pageMeta.height - 20, topY + Math.floor(pageMeta.height * 0.15));
+    }
+
+    const cropH = Math.max(60, botY - topY);
+
+    let cropBuf;
+    try {
+      cropBuf = await sharp(pageBuf)
+        .extract({ left: 0, top: topY, width: pageMeta.width, height: cropH })
+        .png()
+        .toBuffer();
+    } catch (err) {
+      debugLog('PDF_CROP_ERR', `Câu ${qNum}: top=${topY} h=${cropH} pageH=${pageMeta.height} — ${err.message}`);
+      continue;
+    }
+
+    // Upload lên Discord dump channel → lấy CDN URL bền
     const msg = await dumpChannel.send({
-      content: `-# [PDF-Quiz] ${subject} — Câu ${questionNumber} | batch:${batchId}`,
-      files: [{ attachment: buffer, name: `${slugSubject}_cau${questionNumber}.png` }]
+      content: `-# [PDF-Quiz] ${subject} — Câu ${qNum} | batch:${batchId}`,
+      files:   [{ attachment: cropBuf, name: `${slugSubject}_cau${qNum}.png` }],
     });
 
     const imageUrl = msg.attachments.first()?.url;
-    if (!imageUrl) throw new Error(`Không lấy được URL ảnh câu ${questionNumber}.`);
+    if (!imageUrl) throw new Error(`Không lấy được CDN URL cho câu ${qNum}.`);
+
+    const answer = answersArray[qi]?.trim().toUpperCase() ?? '?';
 
     questions.push({
-      id:        `pdf_${slugSubject}_${batchId}_q${questionNumber}`,
+      id:        `pdf_${slugSubject}_${batchId}_q${qNum}`,
       subject,
-      question:  `[IMG] ${subject} — Câu ${questionNumber}`,
+      question:  `[IMG] ${subject} — Câu ${qNum}`,
       options:   { A: 'A', B: 'B', C: 'C', D: 'D' },
       correct:   answer,
       image_url: imageUrl,
     });
 
-    // Cập nhật progress mỗi 4 câu
-    if ((i + 1) % 4 === 0 || i === cropBuffers.length - 1) {
+    // Update progress mỗi 3 câu
+    if (questions.length % 3 === 0 || questions.length === numQuestions) {
       await interaction.editReply({
-        embeds: [new EmbedBuilder()
-          .setColor(COLORS.INFO)
-          .setTitle('⏳ Đang xử lý PDF...')
-          .setDescription(
-            `\`[3/3]\` Upload ảnh: **${i + 1}/${cropBuffers.length}**\n` +
-            `${createProgressBar(i + 1, cropBuffers.length, 20)}`
-          )
-        ]
+        embeds: [progressEmbed(
+          `\`[3/3]\` Upload ảnh: **${questions.length}/${numQuestions}**\n` +
+          createProgressBar(questions.length, numQuestions, 20)
+        )],
       });
     }
   }
 
   return questions;
+}
+
+/** Helper: embed loading đơn giản */
+function progressEmbed(text) {
+  return new EmbedBuilder()
+    .setColor(COLORS.INFO)
+    .setTitle('⏳ Đang xử lý PDF...')
+    .setDescription(text);
 }
 
 async function sendDailyQuiz(channelId = COUNTDOWN_CHANNEL_ID) {
@@ -1593,12 +1688,12 @@ client.on('interactionCreate', async interaction => {
   if (interaction.commandName === 'importpdf') {
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
-    const attachment  = interaction.options.getAttachment('file');
-    const answersRaw  = interaction.options.getString('answers');
-    const subject     = interaction.options.getString('subject').trim();
-    const layoutRaw   = interaction.options.getString('layout');
+    const attachment   = interaction.options.getAttachment('file');
+    const answersRaw   = interaction.options.getString('answers');
+    const subject      = interaction.options.getString('subject').trim();
+    const numQuestions = interaction.options.getInteger('count') ?? 12;
 
-    // Validate file
+    // Validate: phải là PDF
     if (!attachment.name.toLowerCase().endsWith('.pdf')) {
       return interaction.editReply({
         embeds: [new EmbedBuilder()
@@ -1609,65 +1704,44 @@ client.on('interactionCreate', async interaction => {
       });
     }
 
-    // Parse answers
-    const answersArray = answersRaw.split(',').map(a => a.trim().toUpperCase()).filter(a => /^[ABCD]$/.test(a));
-    if (answersArray.length === 0) {
-      return interaction.editReply({
-        embeds: [new EmbedBuilder()
-          .setColor(COLORS.DANGER)
-          .setTitle('❌ Đáp án không hợp lệ')
-          .setDescription('Định dạng: `B,D,A,C,B,D,A,B,D,A,A,B`\nMỗi đáp án phải là một trong **A, B, C, D**.')
-        ]
-      });
-    }
+    // Parse & validate đáp án
+    const answersArray = answersRaw
+      .split(',')
+      .map(a => a.trim().toUpperCase())
+      .filter(a => /^[ABCD]$/.test(a));
 
-    // Parse layout
-    const questionsPerPage = layoutRaw.split(',').map(n => parseInt(n.trim())).filter(n => n > 0);
-    if (questionsPerPage.length === 0) {
+    if (answersArray.length !== numQuestions) {
       return interaction.editReply({
         embeds: [new EmbedBuilder()
           .setColor(COLORS.DANGER)
-          .setTitle('❌ Layout không hợp lệ')
-          .setDescription('Định dạng: `8,4` (trang 1 có 8 câu, trang 2 có 4 câu)\nTổng phải bằng số đáp án đã nhập.')
-        ]
-      });
-    }
-
-    const totalInLayout = questionsPerPage.reduce((a, b) => a + b, 0);
-    if (totalInLayout !== answersArray.length) {
-      return interaction.editReply({
-        embeds: [new EmbedBuilder()
-          .setColor(COLORS.DANGER)
-          .setTitle('❌ Số câu không khớp')
+          .setTitle('❌ Số đáp án không khớp')
           .setDescription(
-            `Layout \`${layoutRaw}\` → tổng **${totalInLayout}** câu\n` +
-            `Đáp án nhập vào → **${answersArray.length}** đáp án\n\n` +
-            `Hai con số phải bằng nhau!`
+            `Cần **${numQuestions}** đáp án (tham số \`count\`), nhưng nhập được **${answersArray.length}** đáp án hợp lệ.\n\n` +
+            `Định dạng: \`B,D,A,C,B,D,A,B,D,A,A,B\` *(chỉ A B C D, cách nhau bằng dấu phẩy)*`
           )
         ]
       });
     }
 
     try {
-      // Download PDF
+      // Download PDF về buffer
       const pdfResponse = await fetch(attachment.url);
       if (!pdfResponse.ok) throw new Error(`Không tải được file PDF: ${pdfResponse.statusText}`);
       const pdfBuffer = Buffer.from(await pdfResponse.arrayBuffer());
 
-      // Convert PDF → crop ảnh → upload → insert DB
+      // Chạy pipeline: render → detect → crop → upload → insert DB
       const questions = await convertPdfToQuizImages(
         pdfBuffer,
         answersArray,
         subject,
-        questionsPerPage,
+        numQuestions,
         PDF_DUMP_CHANNEL_ID,
         interaction
       );
 
       const { inserted, skipped } = await importQuestionsFromJSON(questions);
-
-      const countRes = await pool.query('SELECT COUNT(*) FROM quiz_questions WHERE sent_at IS NULL');
-      const remaining = countRes.rows[0].count;
+      const countRes   = await pool.query('SELECT COUNT(*) FROM quiz_questions WHERE sent_at IS NULL');
+      const remaining  = countRes.rows[0].count;
 
       await interaction.editReply({
         embeds: [new EmbedBuilder()
@@ -1676,7 +1750,7 @@ client.on('interactionCreate', async interaction => {
           .setDescription(
             `📄 **File:** \`${attachment.name}\`\n` +
             `📚 **Môn:** ${subject}\n` +
-            `🗂️ **Layout:** ${layoutRaw} (${questionsPerPage.length} trang)\n\n` +
+            `🔍 **Tự động detect:** ${numQuestions} câu\n\n` +
             `✅ **Thêm mới:** \`${inserted}\` câu ảnh\n` +
             `⏭️ **Bỏ qua (trùng):** \`${skipped}\` câu\n\n` +
             `📦 **Tổng câu chưa dùng:** \`${remaining}\` câu`
@@ -1686,7 +1760,7 @@ client.on('interactionCreate', async interaction => {
         ]
       });
 
-      debugLog('PDF_IMPORT', `${interaction.user.username} import PDF ${attachment.name}: +${inserted} câu ảnh, bỏ ${skipped}`);
+      debugLog('PDF_IMPORT', `${interaction.user.username} import "${attachment.name}": +${inserted} câu (${subject})`);
 
     } catch (err) {
       debugLog('PDF_IMPORT_ERR', err.message);
@@ -1694,7 +1768,7 @@ client.on('interactionCreate', async interaction => {
         embeds: [new EmbedBuilder()
           .setColor(COLORS.DANGER)
           .setTitle('❌ Lỗi xử lý PDF')
-          .setDescription(`\`\`\`\n${err.message}\n\`\`\``)
+          .setDescription(`\`\`\`\n${err.message.substring(0, 1800)}\n\`\`\``)
         ]
       });
     }
@@ -1858,7 +1932,7 @@ client.once('clientReady', async () => {
 
     new SlashCommandBuilder()
       .setName('importpdf')
-      .setDescription('[Admin] Import đề thi PDF thành quiz ảnh tự động')
+      .setDescription('[Admin] Import đề thi PDF thành quiz ảnh tự động (tự detect câu hỏi)')
       .addAttachmentOption(opt =>
         opt.setName('file')
           .setDescription('File PDF chứa đề thi (phần trắc nghiệm)')
@@ -1866,7 +1940,7 @@ client.once('clientReady', async () => {
       )
       .addStringOption(opt =>
         opt.setName('answers')
-          .setDescription('Đáp án các câu theo thứ tự, cách nhau bằng dấu phẩy. VD: B,D,A,C,B,D,A,B,B,A,C,B')
+          .setDescription('Đáp án theo thứ tự, cách bằng dấu phẩy. VD: B,D,A,C,B,D,A,B,B,A,C,B')
           .setRequired(true)
       )
       .addStringOption(opt =>
@@ -1874,10 +1948,12 @@ client.once('clientReady', async () => {
           .setDescription('Tên môn học. VD: Toán, Anh, Lý, Hóa...')
           .setRequired(true)
       )
-      .addStringOption(opt =>
-        opt.setName('layout')
-          .setDescription('Số câu mỗi trang PDF cách nhau bằng dấu phẩy. VD: "8,4" = trang1 có 8 câu, trang2 có 4 câu')
-          .setRequired(true)
+      .addIntegerOption(opt =>
+        opt.setName('count')
+          .setDescription('Số câu trắc nghiệm cần import (mặc định: 12)')
+          .setRequired(false)
+          .setMinValue(1)
+          .setMaxValue(40)
       )
       .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
 
