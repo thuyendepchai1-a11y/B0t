@@ -1029,9 +1029,9 @@ async function convertPdfToQuizImages(pdfBuffer, answersArray, subject, numQuest
   }
 
   const RENDER_SCALE = 2.5;
-  const PAD_TOP      = 35;   // ⬆️ Tăng: lùi lên trên để lấy đủ phần đầu số câu
-  const PAD_BOT      = 30;   // ⬆️ Tăng: cắt cao hơn để tránh lấn câu tiếp theo
-  const MIN_HEIGHT   = 100;  // ⬆️ Đảm bảo ảnh không quá nhỏ
+  const PAD_TOP      = 75;    // ⬆️ Lùi sâu lên để bao phủ đỉnh số câu + công thức trên
+  const PAD_BOT      = 55;    // ⬆️ Cắt sâu vào trước câu tiếp, tránh lấn đáp án/hình
+  const MIN_HEIGHT   = 130;   // Chiều cao tối thiểu mỗi câu
 
   // ── 1. Render chỉ 2 trang đầu (tối ưu cho 12 câu đầu) ──
   await interaction.editReply({ embeds: [progressEmbed('`[1/3]` Đang render PDF → ảnh...')] });
@@ -1089,17 +1089,19 @@ async function convertPdfToQuizImages(pdfBuffer, answersArray, subject, numQuest
 
     let botY;
     if (endBound && endBound.pageIdx === pageIdx) {
-  // Cắt sâu vào trước câu tiếp (lùi nhiều hơn)
       botY = Math.floor(endBound.yPx) - PAD_BOT;
     } else if (endBound && endBound.pageIdx > pageIdx) {
-      botY = pageMeta.height - 40;  // ⬆️ Để lại margin đáy nhiều hơn
+      botY = pageMeta.height - 50;
     } else {
-  // Fallback: ước lượng chiều cao câu toán (thường 25-35% trang)
-      botY = Math.min(pageMeta.height - 40, topY + Math.floor(pageMeta.height * 0.28));
+      botY = Math.min(pageMeta.height - 50, topY + Math.floor(pageMeta.height * 0.30));
     }
 
-// Đảm bảo chiều cao tối thiểu
-    const cropH = Math.max(MIN_HEIGHT, botY - topY);
+    // ⭐ FIX CHỐNG CẮT NGƯỢC / CÂU QUÁ NGẮN
+    if (botY <= topY + MIN_HEIGHT) {
+      botY = topY + MIN_HEIGHT;
+    }
+
+    const cropH = botY - topY;
 
     let cropBuf;
     try {
