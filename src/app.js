@@ -1035,8 +1035,8 @@ async function convertPdfToQuizImages(pdfBuffer, answersArray, subject, numQuest
   const questions = [];
   const slugSubject = subject.toLowerCase().replace(/[^a-z0-9]/g, '_');
   const batchId = Date.now();
-  const TOP_OFFSET = 20;   // dịch lên trên 10px (bao gồm cả 5px bạn muốn thêm)
-  const BOT_OFFSET = 2;    // giữ nguyên
+  const TOP_OFFSET = 30;   // dịch lên trên 10px (bao gồm cả 5px bạn muốn thêm)
+  const BOT_OFFSET = 15;    // giữ nguyên
 
   for (let qi = 0; qi < numQuestions; qi++) {
     const qNum = qi + 1;
